@@ -1,0 +1,105 @@
+import socket, sys, threading, time, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterator
+from tqdm import tqdm
+
+# ================== 可配置常量 ==================
+TARGET_IP = "127.0.0.1"        # 固定要扫描的 IP（按需改成你的目标 IP）
+PORT_SCAN_TIMEOUT = 2.0        # 端口探测超时（秒）
+MAX_WORKERS_SCAN = min(500, (os.cpu_count() or 1) * 50)
+BATCH_SIZE_SCAN = 2000         # 每批任务数（过大易占用过多资源）
+RESULT_OPEN = "open_ports.txt" # 输出文件
+# ==============================================
+
+lock = threading.Lock()
+open_cnt = 0
+pbar: tqdm = None
+
+def check_port(ip: str, port: int) -> bool:
+    """尝试连接端口，成功即开放"""
+    try:
+        s = socket.create_connection((ip, port), timeout=PORT_SCAN_TIMEOUT)
+        s.close()
+        return True
+    except:
+        return False
+
+def port_range_generator(start_port: int, end_port: int) -> Iterator[int]:
+    for p in range(start_port, end_port + 1):
+        yield p
+
+def chunked(iterable, size):
+    it = iter(iterable)
+    while True:
+        chunk = []
+        try:
+            for _ in range(size):
+                chunk.append(next(it))
+            yield chunk
+        except StopIteration:
+            if chunk:
+                yield chunk
+            break
+
+def main():
+    global pbar, open_cnt
+    print("固定 IP 端口扫描器（参照原脚本风格）")
+    print(f"目标 IP：{TARGET_IP}\n")
+
+    rng = input("端口区间 (如 1-65535): ").strip()
+    if not rng or "-" not in rng:
+        print("[!] 请输入正确区间，如 1-1024")
+        return
+
+    try:
+        start_port, end_port = [int(x) for x in rng.split("-", 1)]
+        if not (0 < start_port <= 65535 and 0 < end_port <= 65535 and start_port <= end_port):
+            raise ValueError
+    except:
+        print("[!] 端口区间不合法，必须是 1-65535 范围内的整数，且前者 <= 后者")
+        return
+
+    total_ports = end_port - start_port + 1
+
+    # 准备输出文件
+    with open(RESULT_OPEN, "w", encoding="utf-8") as f:
+        f.write(f"# {TARGET_IP} 开放端口列表\n")
+        f.write(f"# 扫描范围: {start_port}-{end_port}\n")
+        f.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+    print(f"\n[步骤] 起飞 → 扫描 {TARGET_IP} 的端口 {start_port}-{end_port}\n")
+    pbar = tqdm(total=total_ports, desc="扫描端口", unit="port", ncols=90,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
+
+    open_ports = []
+    with ThreadPoolExecutor(MAX_WORKERS_SCAN) as exe:
+        batch_idx = 0
+        for port_batch in chunked(port_range_generator(start_port, end_port), BATCH_SIZE_SCAN):
+            batch_idx += 1
+            future_map = {exe.submit(check_port, TARGET_IP, p): p for p in port_batch}
+            for fut in as_completed(future_map):
+                port = future_map[fut]
+                try:
+                    if fut.result():
+                        with lock:
+                            open_cnt += 1
+                            open_ports.append(port)
+                            with open(RESULT_OPEN, "a", encoding="utf-8") as f:
+                                f.write(f"{port}\n")
+                finally:
+                    pbar.update(1)
+            print(f"[i] 第 {batch_idx} 批完成，累计 {min(batch_idx * BATCH_SIZE_SCAN, total_ports)} 个端口")
+
+    pbar.close()
+    print(f"\n[完成] {TARGET_IP} 在 {total_ports} 个端口中共开放 {open_cnt} 个 → {RESULT_OPEN}\n")
+
+    if open_ports:
+        sample = ", ".join(str(p) for p in open_ports[:20])
+        print(f"示例（前 20 个）：{sample}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n已手动停止，当前进度：{open_cnt} 个开放端口")
+        sys.exit(0)
